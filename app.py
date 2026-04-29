@@ -1,142 +1,104 @@
-#!/usr/bin/env python3
-
 import os
-import logging
-import base64
-from typing import List, Optional
-
+import gc
+import shutil
 import gdown
-import cv2
-import numpy as np
-import easyocr
-from fastapi import FastAPI, File, UploadFile, Form, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, UploadFile, File
 from ultralytics import YOLO
 
-# -------------------------
-# Config / Logging
-# -------------------------
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("yolo-plates")
+app = FastAPI()
 
 MODEL_PATH = "best.pt"
+MODEL_URL = "https://drive.google.com/uc?id=13zoDhJcnL8LSzVL9eo5qNbyRysIP4tuW"
 
-# -------------------------
-# Descargar modelo (FIX REAL)
-# -------------------------
+model = None
+reader = None
+
+# 📥 Descargar modelo
 def download_model():
-    if os.path.exists(MODEL_PATH) and os.path.getsize(MODEL_PATH) > 1_000_000:
-        logger.info("✅ Modelo ya existe.")
-        return
+    if not os.path.exists(MODEL_PATH):
+        print("⬇️ Descargando modelo...")
+        gdown.download(MODEL_URL, MODEL_PATH, quiet=False)
+        print("✅ Modelo descargado")
 
-    logger.info("⬇️ Descargando modelo con gdown...")
+# 🧠 YOLO (carga diferida)
+def get_model():
+    global model
+    if model is None:
+        print("🔹 Cargando YOLO...")
+        model = YOLO(MODEL_PATH)
+    return model
 
-    url = "https://drive.google.com/uc?id=13zoDhJcnL8LSzVL9eo5qNbyRysIP4tuW"
-    gdown.download(url, MODEL_PATH, quiet=False)
+# 🔤 easyocr (carga diferida)
+def get_reader():
+    global reader
+    if reader is None:
+        print("🔹 Cargando EasyOCR...")
+        import easyocr
+        reader = easyocr.Reader(['en'], gpu=False)
+    return reader
 
-    if not os.path.exists(MODEL_PATH) or os.path.getsize(MODEL_PATH) < 1_000_000:
-        raise RuntimeError("❌ El modelo no se descargó correctamente")
-
-    logger.info("✅ Modelo descargado correctamente.")
-
-download_model()
-
-# -------------------------
-# Parámetros
-# -------------------------
-OCR_LANGS = ["en"]
-CONF_THRESH = 0.25
-
-# -------------------------
-# App init
-# -------------------------
-app = FastAPI(title="Detector de Placas YOLOv8")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# -------------------------
-# Cargar modelo y OCR
-# -------------------------
-logger.info("🔹 Cargando modelo YOLO...")
-model = YOLO(MODEL_PATH)
-logger.info("✅ Modelo cargado.")
-
-reader = easyocr.Reader(OCR_LANGS, gpu=False)
-
-# -------------------------
-# Helpers
-# -------------------------
-def ocr_read_text_from_roi(roi):
-    try:
-        if roi is None or roi.size == 0:
-            return None
-        roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
-        result = reader.readtext(roi_rgb)
-        if not result:
-            return None
-        best = max(result, key=lambda x: x[2])
-        text = "".join(ch for ch in best[1] if ch.isalnum())
-        return text.upper() if text else None
-    except:
-        return None
-
-def image_to_base64(img):
-    _, buffer = cv2.imencode('.jpg', img)
-    return base64.b64encode(buffer).decode('utf-8')
-
-# -------------------------
-# Rutas
-# -------------------------
-@app.get("/", response_class=HTMLResponse)
+@app.get("/")
 def home():
-    return "<h1>API YOLO funcionando 🚀</h1>"
+    return {"status": "API funcionando 🚀"}
 
-@app.post("/predict/")
-async def predict(file: UploadFile = File(...), conf: float = 0.25):
-    try:
-        contents = await file.read()
-        nparr = np.frombuffer(contents, np.uint8)
-        frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+@app.post("/predict")
+async def predict(file: UploadFile = File(...)):
+    temp_path = "temp.jpg"
 
-        results = model.predict(source=frame, conf=conf, verbose=False)
+    # Guardar imagen
+    with open(temp_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
 
-        placas = []
+    # ======================
+    # 1️⃣ DETECCIÓN (YOLO)
+    # ======================
+    model = get_model()
+    results = model(temp_path)
 
-        for r in results:
-            for box in r.boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                roi = frame[y1:y2, x1:x2]
+    detections = []
+    crops = []
 
-                text = ocr_read_text_from_roi(roi)
-                if text:
-                    placas.append(text)
+    for r in results:
+        for box in r.boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            conf = float(box.conf[0])
 
-                # dibujar caja
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0,255,0), 2)
+            detections.append({
+                "confidence": conf,
+                "bbox": [x1, y1, x2, y2]
+            })
 
-        img_b64 = image_to_base64(frame)
+            # guardar recorte
+            import cv2
+            img = cv2.imread(temp_path)
+            crop = img[y1:y2, x1:x2]
+            crop_path = f"crop_{len(crops)}.jpg"
+            cv2.imwrite(crop_path, crop)
+            crops.append(crop_path)
 
-        return {
-            "placas": placas,
-            "image": img_b64,
-            "success": True
-        }
+    # 🔥 liberar YOLO
+    del model
+    gc.collect()
 
-    except Exception as e:
-        logger.exception("Error en predict")
-        return {"error": str(e)}
+    # ======================
+    # 2️⃣ OCR (easyocr)
+    # ======================
+    reader = get_reader()
 
-# -------------------------
-# Main (IMPORTANTE)
-# -------------------------
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", 10000))
-    uvicorn.run("app:app", host="0.0.0.0", port=port)
+    texts = []
+    for crop_path in crops:
+        result = reader.readtext(crop_path)
+        for (_, text, conf) in result:
+            texts.append({
+                "text": text,
+                "confidence": conf
+            })
+        os.remove(crop_path)
+
+    return {
+        "detections": detections,
+        "texts": texts
+    }
+
+# Ejecutar descarga al inicio
+download_model()
