@@ -5,6 +5,7 @@
 import os
 import logging
 import base64
+import requests
 from typing import List, Optional
 from fastapi import FastAPI, File, UploadFile, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,6 +22,32 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("yolo-plates")
 
 MODEL_PATH = os.getenv("MODEL_PATH", "best.pt")
+
+# -------------------------
+# Descargar modelo desde Google Drive si no existe
+# -------------------------
+def download_model():
+    if os.path.exists(MODEL_PATH):
+        logger.info("✅ Modelo ya existe en disco.")
+        return
+    logger.info("⬇️ Descargando best.pt desde Google Drive...")
+    file_id = "13zoDhJcnL8LSzVL9eo5qNbyRysIP4tuW"
+    url = f"https://drive.google.com/uc?export=download&id={file_id}"
+    session = requests.Session()
+    response = session.get(url, stream=True)
+    # Manejar confirmación de archivo grande
+    for key, value in response.cookies.items():
+        if key.startswith("download_warning"):
+            url = f"https://drive.google.com/uc?export=download&confirm={value}&id={file_id}"
+            response = session.get(url, stream=True)
+            break
+    with open(MODEL_PATH, "wb") as f:
+        for chunk in response.iter_content(chunk_size=32768):
+            if chunk:
+                f.write(chunk)
+    logger.info("✅ Modelo descargado correctamente.")
+
+download_model()
 OCR_LANGS = os.getenv("OCR_LANGS", "en").split(",")
 CONF_THRESH = float(os.getenv("CONF_THRESH", 0.25))
 RETURN_IMAGE = True
